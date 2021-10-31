@@ -39,12 +39,26 @@ class bcolors:
 # 4 ACK
 # 5 ERROR
 '''
-                    2 bytes     2 bytes      n bytes
-                   ----------------------------------
-                  | Opcode |   Block #  |   Data     |
-                   ----------------------------------
+                   TFTP Formats
 
-                        Figure 5-2: DATA packet
+   Type   Op #     Format without header
+
+          2 bytes    string   1 byte     string   1 byte
+          -----------------------------------------------
+   RRQ/  | 01/02 |  Filename  |   0  |    Mode    |   0  |
+   WRQ    -----------------------------------------------
+          2 bytes    2 bytes       n bytes
+          ---------------------------------
+   DATA  | 03    |   Block #  |    Data    |
+          ---------------------------------
+          2 bytes    2 bytes
+          -------------------
+   ACK   | 04    |   Block #  |
+          --------------------
+          2 bytes  2 bytes        string    1 byte
+          ----------------------------------------
+   ERROR | 05    |  ErrorCode |   ErrMsg   |   0  |
+          ----------------------------------------
 
 Data dentro del paquete DATA tiene un maximo de 512 Bytes
 
@@ -74,44 +88,37 @@ def desencriptar(ciphertext, key):
 
 def sendDATA(id, udpcsocket, blockn, msg, sap, bfsz, key): #region critica, aqui se realiza la comunicacion con el servidor
     while True:
-        try:  ## SI ES CORRUPTO Y NO LLEGA ACK O EL ACK NO LLEGA A TIEMPO O EL ACK NO COINCIDE CON EL ESPERADO -> OCURRE UN TIMEOUT Y SE REENVIA EL PAQUETE
-            if blockn < 10:
-                blk = '00' + str(blockn)
-            elif blockn >= 10 and blockn < 100:
-                blk = '0' + str(blockn)
-            else:
-                blk = str(blockn)
-
-            Data = "3".encode() + blk.encode() + msg # data pkg
-
+        try:  ## SI ES CORRUPTO Y NO LLEGA ACK O EL ACK NO LLEGA A TIEMPO O EL ACK NO COINCIDE CON EL ESPERADO -> OCURRE UN TIMEOUT Y SE REENVIA EL PAQUETE          
             #ENCRIPTAMOS EL PAQUETE DATA ANTES DE ENVIARLO
-
             #EL PAQUETE TIENE QUE TENER UN LARGO MULTIPLO DE 16 BYTES, POR LO QUE AJUSTAMOS ESO
-            #528 ES EL NUMERO BUSCADO
-            n = len(Data)
+            data_ = msg
+            n = len(data_)
             n_1 = 0
             #print(n)
-            pad = ""
-            if n < 516: #cuando hay 512 bytes en data, el paquete queda de 516 bytes en total
+            pad = ''
+            if n < 512: #si el chunk de informacion a encriptar no tiene un largo multiplo de 16 bytes, tenemos que hacerle padding
                 while (n+n_1) % 16 != 0: #padding
                     n_1+=1
-                #print("n: " + str(n))
                 for x in range(n_1):
-                    pad = pad + "9"
-                Data = Data + pad.encode()
-            else:
-                Data = Data + "123456789012".encode()#se deja el paquete como multiplo de 16 al añadirle 12 bytes extras
-            #print(len(Data))        
-            encriptedData = encriptar(Data, key)
-            udpcsocket.sendto(encriptedData, sap)
+                    pad = pad + ' ' #se le agregan espacios al final
+                data_ = data_ + pad.encode()
+            #cuando hay 512 bytes en data, el paquete queda de 516 bytes en total
+            encriptedData = encriptar(data_, key)
+            Data = (3).to_bytes(2,'little') + (blockn).to_bytes(2,'little') + encriptedData
+            udpcsocket.sendto(Data, sap)
             while True:
                 msgFromServer = udpcsocket.recvfrom(bfsz) # se recibe la confirmacion del mensaje
-                msgack = msgFromServer[0].decode("utf-8")
-                print("ACK: " + msgack[1:4]) #se imprime la confirmacion en el bash
-                if int(msgack[0]) == 4 and int(msgack[1:4]) == blockn: #mientras no se reciba el ack correcto, se seguira en escucha hasta que ocurra un timeout, en caso contrario se sale del loop
+                recvpkt = msgFromServer[0]
+                code = int.from_bytes(recvpkt[0:2], 'little')
+                if code == 4: #mientras no se reciba el ack correcto, se seguira en escucha hasta que ocurra un timeout, en caso contrario se sale del loop
+                    msgack = int.from_bytes(recvpkt[2:], 'little')
+                    if msgack == blockn:
+                        print("ACK WRQ: " + str(msgack)) #se imprime la confirmacion en el bash
                     break
-                elif int(msgack[0]) == 5:
-                    print(bcolors.FAIL + "Cliente " + str(id) + " recibio ERROR, ERROR SERVIDOR: " + msgack + " FIN DE CONEXION" + bcolors.ENDC) 
+                elif code == 5:
+                    errorcode = str(int.from_bytes(recvpkt[2:4], 'little'))
+                    errormsg = recvpkt[4:len(recvpkt)-1].decode("utf-8")
+                    print(bcolors.FAIL + "Cliente " + str(id) + " recibio ERROR, ERROR SERVIDOR: CODE=" + errorcode + " " + errormsg + " FIN DE CONEXION" + bcolors.ENDC)
                     break
                 print(bcolors.FAIL + "Cliente " + str(id) + " recibio ACK Incorrecto" + bcolors.ENDC)
         except socket.timeout:
@@ -126,23 +133,25 @@ def sendDATA(id, udpcsocket, blockn, msg, sap, bfsz, key): #region critica, aqui
 def sendWRQ(id, udpcsocket, blockn, sap, bfsz, fileName, net_mode):
     while True:
         try:
-            wrqpkg = "2".encode() + fileName.encode() + "0".encode() + net_mode.encode() + "0".encode()
+            wrqpkg = (2).to_bytes(2,'little') + fileName.encode() + (0).to_bytes(1,'little') + net_mode.encode() + (0).to_bytes(1,'little')
             udpcsocket.sendto(wrqpkg, sap) #se envia el wrqpkg
             while True:
                 msgFromServer = udpcsocket.recvfrom(bfsz) # se recibe la confirmacion del mensaje
-                msg1 = msgFromServer[0].decode("utf-8")
+                recvpkt = msgFromServer[0]
+                code = int.from_bytes(recvpkt[0:2], 'little')
                 addresss = msgFromServer[1]
-                msg2 = "ACK WRQ: " + msg1[1] #+(format(msgFromServer[0]))[2] #se decodifica
-                print(msg2) #se imprime la confirmacion en el bash
-                #print(msg1) 
-                if int(msg1[0]) == 4 and int(msg1[1]) == blockn: #mientras no se reciba el ack correcto (opcode = 6, y bloque correcto), se seguira en escucha hasta que ocurra un timeout, en caso contrario se sale del loop
-                    port = addresss[1]
+                if code == 4: #mientras no se reciba el ack correcto (opcode = 6, y bloque correcto), se seguira en escucha hasta que ocurra un timeout, en caso contrario se sale del loop
+                    ack = int.from_bytes(recvpkt[2:], 'little')
+                    if ack == blockn:
+                        print("ACK WRQ: " + str(ack)) #se imprime la confirmacion en el bash
+                        port = addresss[1]
                     #print(port)
                     break
-                elif int(msg1[0]) == 5: #SI LLEGA UN ERROR SE TERMINA LA CONEXION
-                    print(bcolors.FAIL + "Cliente " + str(id) + " recibio ERROR, ERROR SERVIDOR: " + msg1 + " FIN DE CONEXION" + bcolors.ENDC)
-                    exit() 
-                    break
+                elif code == 5: #SI LLEGA UN ERROR SE TERMINA LA CONEXION
+                    errorcode = str(int.from_bytes(recvpkt[2:4], 'little'))
+                    errormsg = recvpkt[4:len(recvpkt)-1].decode("utf-8")
+                    print(bcolors.FAIL + "Cliente " + str(id) + " recibio ERROR, ERROR SERVIDOR: CODE=" + errorcode + " " + errormsg + " FIN DE CONEXION" + bcolors.ENDC)
+                    exit()
                 print(bcolors.FAIL + "Cliente " + str(id) + " recibio ACK del WRQ Incorrecto" + bcolors.ENDC)
         except socket.timeout:
             print(bcolors.FAIL + "Cliente " + str(id) + " Sin confirmación del WRQ, reenviando [Timeout 2s]" + bcolors.ENDC) # si no hay confirmacion imprimimos el error en el bash
@@ -153,8 +162,7 @@ def sendWRQ(id, udpcsocket, blockn, sap, bfsz, fileName, net_mode):
     return port
 
 def sendRRQ(udpcsocket, sap, fileName, net_mode):
-    #port = random.randint(20002, 20100)
-    rrqpkg = "1".encode() + fileName.encode() + "0".encode() + net_mode.encode() + "0".encode() 
+    rrqpkg = (1).to_bytes(2,'little') + fileName.encode() + (0).to_bytes(1,'little') + net_mode.encode() + (0).to_bytes(1,'little')
     udpcsocket.sendto(rrqpkg, sap) #se envia el wrqpkg
     
 
@@ -189,8 +197,6 @@ class Cliente(Thread):
                 contents = f.read()
                 #print(contents)
 
-            #sizetest = len(contents.encode('utf-8'))
-
             #SE MANDA EL WRQ Y SE RECIBE EL NUEVO PUERTO PARA NO CONGESTIONAR EL PUERTO TFTP
             print("Cliente " + str(self.id) + " Esta Intentando enviar WRQ para archivo: " + nombre_archivo)
             port = sendWRQ(self.id, UDPClientSocket, block, serverAddressPort, bufferSize, nombre_archivo, netmode)
@@ -220,69 +226,66 @@ class Cliente(Thread):
             print("Cliente " + str(self.id) + " Esta Intentando enviar RRQ para archivo: " + nombre_archivo)
             sendRRQ(UDPClientSocket, serverAddressPort, nombre_archivo, netmode)
             UDPClientSocket.settimeout(3) #tiempo de gracia (3 segundos) para terminar conexion, en caso de que el ack final se haya perdido o no llegue DATA despues de enviar el RRQ
-            ack = ''
-            key = ''
+            ack = 0
+            key = 0
             while True:
                 time.sleep(0.5)
                 try:
                     #########################################
                     bytesAddressPair = UDPClientSocket.recvfrom(bufferSize)
-                    message = bytesAddressPair[0]
+                    serverMsg = bytesAddressPair[0]
                     address = bytesAddressPair[1]
                     #########################################
                     print(bcolors.WARNING + "Link bussy" + bcolors.ENDC)
                     time.sleep(0.5)
                     #########################################
-                    #print(len(message)) #LOS PAQUETES QUE LLEGAN SON DE 528 BYTES
+                    #print(len(message)) #LOS PAQUETES QUE LLEGAN SON DE 516 BYTES
                     tid = str(address[1])
-                    if ack == '':
-                        key = gen_key(str(tid)) #generamos key para descifrar lo pedido al servidor
-                    if len(message) < 528:
-                        finalBlock = True
-                    #DESENCRIPTAMOS EL MENSAJE
-                    clientMsg = desencriptar(message, key)
-                    #LE QUITAMOS EL PADDING
-                    n = len(clientMsg)
-                    if n == 528:
-                        clientMsg = clientMsg[0:516]
-                        clientMsg = clientMsg.decode("utf-8")
-                    else:
-                        clientMsg = clientMsg.decode("utf-8")
-                        while clientMsg[-1] == '9':
-                            clientMsg = clientMsg[:-1]
-                    #print(clientMsg)  
-                    ################################
                     if not tid in buffer:
                         buffer[tid] = ""
-                    if clientMsg == buffer[tid]:
-                        print(bcolors.FAIL + "DUPLICADO DETECTADO" + bcolors.ENDC) #enviamos nuevamente una confirmacion en caso de que se haya perdido el ack y se desecha el paquete
-                        ack = clientMsg[1:4] #redundante?
-                        ##HAY QUE ENVIAR UN MENSAJE DE ERROR SEGUN EL PROTOCOLO
-                    else:
-                        buffer[tid] = clientMsg    #guardamos el paquete de ese cliente en el diccionario del buffer
-                        #print(clientMsg[3])
-                        opCode = int(clientMsg[0])
-                        if opCode == 1 :
-                            #error 4, operacion tftp invalida
-                             pkg = "5".encode() + "4".encode() + "Se esperaba un DATA pkg (se recibio un RRQ)".encode() + "0".encode() #ERROR PKG
-                        elif opCode == 2 :
-                            #error 4, operacion tftp invalida
-                            pkg = "5".encode() + "4".encode() + "Se esperaba un DATA pkg (se recibio un WRQ)".encode() + "0".encode() #ERROR PKG
-                        elif opCode == 3 :
-                            ack = clientMsg[1:4]
-                            pkg = "4".encode() + ack.encode()#str.encode(ack)
-                            if not tid in mensajes:
-                                mensajes[tid] = clientMsg[4:]
-                            else:
-                                mensajes[tid] = mensajes[tid] + clientMsg[4:] #vamos guardando el mensaje
-                        elif opCode == 4:
-                            #error 4, operacion tftp invalida
-                            pkg = "5".encode() + "4".encode() + "Se esperaba un DATA pkg (se recibio un ACK)".encode() + "0".encode() #ERROR PKG
-                        elif opCode == 5:
-                            #error 4, operacion tftp invalida
-                            print(bcolors.FAIL + "Cliente " + str(id) + " recibio ERROR, ERROR SERVIDOR: " + clientMsg + " FIN DE CONEXION" + bcolors.ENDC) 
-                            #pkg = "5".encode() + "4".encode + "Se esperaba un DATA pkg (se recibio un ERROR)" + "0".encode #ERROR PKG
-                            break
+                    if ack == 0:
+                        key = gen_key(tid) #generamos key para descifrar lo pedido al servidor
+                    if len(serverMsg) < 516:
+                        finalBlock = True
+                    #print(clientMsg)  
+                    ################################
+                    opCode = int.from_bytes(serverMsg[0:2], 'little')
+                    if opCode == 1:
+                        #error 4, operacion tftp invalida
+                        msgError = "Se esperaba un DATA pkg (se recibio un RRQ)"
+                        pkg = (5).to_bytes(2, 'little') + (4).to_bytes(2, 'little') + msgError.encode() + (0).to_bytes(1, 'little') #ERROR PKG
+                    elif opCode == 2:
+                        #error 4, operacion tftp invalida
+                        msgError = "Se esperaba un DATA pkg (se recibio un WRQ)"
+                        pkg = (5).to_bytes(2, 'little') + (4).to_bytes(2, 'little') + msgError.encode() + (0).to_bytes(1, 'little') #ERROR PKG
+                    elif opCode == 3:
+                        ack = int.from_bytes(serverMsg[2:4], 'little')#clientMsg[1:4]
+                        #DESENCRIPTAMOS EL MENSAJE
+                        msg = desencriptar(serverMsg[4:], key).decode('utf-8')
+                        #LE QUITAMOS EL PADDING
+                        while msg[-1] == ' ':
+                            msg = msg[:-1]
+                        #DETECCION DE DUPLICADOS
+                        #print(msg)
+                        if msg == buffer[tid]:
+                            print(bcolors.FAIL + "DUPLICADO DETECTADO" + bcolors.ENDC) #enviamos nuevamente una confirmacion en caso de que se haya perdido el ack y se desecha el paquete
+                        else:
+                            buffer[tid] = serverMsg    #guardamos el paquete del servidor en el diccionario del buffer
+                        #print(msg)
+                        pkg = (4).to_bytes(2, 'little') + serverMsg[2:4]
+                        if not tid in mensajes:
+                            mensajes[tid] = msg
+                        else:
+                            mensajes[tid] = mensajes[tid] + msg #vamos guardando el mensaje
+                    elif opCode == 4:
+                        #error 4, operacion tftp invalida
+                        msgError = "Se esperaba un DATA pkg (se recibio un ACK)"
+                        pkg = (5).to_bytes(2, 'little') + (4).to_bytes(2, 'little') + msgError.encode() + (0).to_bytes(1, 'little') #ERROR PKG
+                    elif opCode == 5:
+                        #error 4, operacion tftp invalida
+                        msgError = "Cliente " + str(id) + " recibio ERROR de Servidor"
+                        pkg = (5).to_bytes(2, 'little') + (4).to_bytes(2, 'little') + msgError.encode() + (0).to_bytes(1, 'little') #ERROR PKG
+                        break
                     time.sleep(0.2)
                     # Se envia el ack correspondiente
                     UDPClientSocket.sendto(pkg, address)
